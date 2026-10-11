@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId = "ve.com.sagues.rafael.android_mouse"
-        minSdk = 24
+        minSdk = 28
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
