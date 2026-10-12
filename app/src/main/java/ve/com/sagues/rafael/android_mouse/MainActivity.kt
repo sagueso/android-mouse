@@ -1,6 +1,8 @@
 package ve.com.sagues.rafael.android_mouse
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -10,7 +12,11 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -31,9 +37,27 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        mouseManager = BluetoothMouseManager(this)
+        mouseManager = BluetoothMouseManager.getInstance(this)
 
-        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val discoverableLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            mouseManager.onDiscoverableResult(result.resultCode)
+        }
+
+        // A HID device is only reachable by a host while it is discoverable.
+        val makeDiscoverable: () -> Unit = {
+            val intent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
+                putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
+            }
+            discoverableLauncher.launch(intent)
+        }
+
+        val notificationPermissionLauncher = registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { /* Notification is optional; the service runs either way. */ }
+
+        val btPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             arrayOf(
                 Manifest.permission.BLUETOOTH_CONNECT,
                 Manifest.permission.BLUETOOTH_ADVERTISE,
@@ -43,23 +67,32 @@ class MainActivity : ComponentActivity() {
             emptyArray()
         }
 
-        val requestPermissionLauncher = registerForActivityResult(
+        val btPermissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
         ) { perms ->
-            val allGranted = perms.values.all { it }
-            if (allGranted || permissions.isEmpty()) {
-                mouseManager.init() // Success!
+            if (perms.values.all { it } || btPermissions.isEmpty()) {
+                startHidService() // Success!
             } else {
                 mouseManager.setPermissionError() // FAILED: Update the UI!
             }
         }
 
-        if (permissions.isNotEmpty() && permissions.any { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }) {
+        val missingBtPermission = btPermissions.any {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (btPermissions.isNotEmpty() && missingBtPermission) {
             // Ask for permission
-            requestPermissionLauncher.launch(permissions)
+            btPermissionLauncher.launch(btPermissions)
         } else {
             // Already have permission
-            mouseManager.init()
+            startHidService()
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
         setContent {
@@ -67,22 +100,44 @@ class MainActivity : ComponentActivity() {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     DebugGestureTracker(
                         mouseManager = mouseManager,
+                        onRequestDiscoverable = makeDiscoverable,
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
             }
         }
     }
+
+    private fun startHidService() {
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, HidForegroundService::class.java)
+        )
+    }
 }
 
 @Composable
 fun DebugGestureTracker(
     mouseManager: BluetoothMouseManager,
+    onRequestDiscoverable: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     // Read state from Manager
     val status by mouseManager.status.collectAsState()
     val logs by mouseManager.logs.collectAsState()
+    val registered by mouseManager.registered.collectAsState()
+    val savedHosts by mouseManager.savedHosts.collectAsState()
+    val activeAddress by mouseManager.activeHostAddress.collectAsState()
+
+    // On the very first run (no saved host) automatically ask to become discoverable so
+    // the host can pair. Afterwards we reconnect to the active host without pairing again.
+    var discoverabilityRequested by remember { mutableStateOf(false) }
+    LaunchedEffect(registered) {
+        if (registered && !discoverabilityRequested && !mouseManager.hasSavedHost()) {
+            discoverabilityRequested = true
+            onRequestDiscoverable()
+        }
+    }
 
     // Read gestures for debug screen
     var currentDx by remember { mutableFloatStateOf(0f) }
@@ -90,7 +145,7 @@ fun DebugGestureTracker(
 
     Column(modifier = modifier.fillMaxSize()) {
 
-        // --- TOP: DEBUG INFO ---
+        // --- TOP: DEBUG INFO + HOST SWITCHER ---
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -100,6 +155,43 @@ fun DebugGestureTracker(
             Text("Status: $status", fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
             Spacer(modifier = Modifier.height(8.dp))
             Text("Sent dx: $currentDx | dy: $currentDy")
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(onClick = onRequestDiscoverable) { Text("Discoverable") }
+                OutlinedButton(
+                    onClick = { mouseManager.reconnect() },
+                    enabled = activeAddress != null
+                ) { Text("Reconnect") }
+                OutlinedButton(
+                    onClick = { activeAddress?.let { mouseManager.forgetHost(it) } },
+                    enabled = activeAddress != null
+                ) { Text("Forget & Unpair") }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = if (savedHosts.isEmpty())
+                    "No saved hosts yet. Tap Discoverable and pair from your PC/TV."
+                else
+                    "Saved hosts (tap to switch):",
+                fontSize = 12.sp
+            )
+            if (savedHosts.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(savedHosts, key = { it.address }) { host ->
+                        FilterChip(
+                            selected = host.address == activeAddress,
+                            onClick = { mouseManager.selectHost(host.address) },
+                            label = { Text(host.name) }
+                        )
+                    }
+                }
+            }
         }
 
         // --- MIDDLE: TRACKPAD AREA ---
