@@ -20,6 +20,9 @@ class BluetoothMouseManager private constructor(private val context: Context) {
         private const val KEY_HOSTS = "saved_hosts"
         private const val MAX_RECONNECT_ATTEMPTS = 5
         private const val RECONNECT_DELAY_MS = 3000L
+        private const val SCROLL_DIVISOR = 60f
+        private const val ZOOM_SENSITIVITY = 8f
+        private const val DOUBLE_CLICK_GAP_MS = 40L
 
         @Volatile
         private var instance: BluetoothMouseManager? = null
@@ -40,6 +43,9 @@ class BluetoothMouseManager private constructor(private val context: Context) {
     private var connectedHost: BluetoothDevice? = null
     private var initialized = false
     private var reconnectAttempts = 0
+
+    // Mouse button state (bit0 left, bit1 right, bit2 middle).
+    private var buttonMask = 0
 
     // The host we want to talk to / reconnect to (the "active" host).
     private val _activeHostAddress = MutableStateFlow(prefs.getString(KEY_LAST_HOST, null))
@@ -69,9 +75,12 @@ class BluetoothMouseManager private constructor(private val context: Context) {
     private val _logs = MutableStateFlow<List<String>>(emptyList())
     val logs: StateFlow<List<String>> = _logs.asStateFlow()
 
-    // Sub-pixel movement is accumulated so slow drags still move the cursor.
+    // Sub-pixel movement is accumulated so slow gestures still register.
     private var pendingX = 0f
     private var pendingY = 0f
+    private var pendingScrollX = 0f
+    private var pendingScrollY = 0f
+    private var pendingZoom = 0f
 
     private fun log(message: String) {
         // Keep the last 15 logs
@@ -233,11 +242,11 @@ class BluetoothMouseManager private constructor(private val context: Context) {
     }
 
     private fun registerApp() {
-        log("Registering App as Mouse...")
+        log("Registering App as Mouse + Keyboard...")
         val sdpRecord = BluetoothHidDeviceAppSdpSettings(
-            "Android Mouse", "My Custom Mouse", "ve.com.sagues.rafael",
-            BluetoothHidDevice.SUBCLASS1_MOUSE,
-            MouseConfig.MOUSE_REPORT_DESCRIPTOR
+            "Android Mouse", "Android Mouse + Keyboard", "ve.com.sagues.rafael",
+            BluetoothHidDevice.SUBCLASS1_COMBO,
+            MouseConfig.COMBO_REPORT_DESCRIPTOR
         )
 
         val qosOut = BluetoothHidDeviceAppQosSettings(
@@ -314,6 +323,7 @@ class BluetoothMouseManager private constructor(private val context: Context) {
             when (state) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectedHost = device
+                    buttonMask = 0
                     reconnectAttempts = 0
                     if (device != null) {
                         upsertHost(device)
@@ -332,6 +342,7 @@ class BluetoothMouseManager private constructor(private val context: Context) {
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     connectedHost = null
+                    buttonMask = 0
                     _status.value = "Disconnected - reconnecting..."
                     log("Host Disconnected: $name")
                     scheduleReconnect()
@@ -351,14 +362,32 @@ class BluetoothMouseManager private constructor(private val context: Context) {
         }
     }
 
+    // -------------------- reports --------------------
+
+    private fun sendMouseReport(buttons: Int, dx: Int, dy: Int, wheel: Int, pan: Int) {
+        val host = connectedHost ?: return
+        val hid = hidDevice ?: return
+        val report = byteArrayOf(
+            buttons.toByte(),
+            dx.toByte(),
+            dy.toByte(),
+            wheel.toByte(),
+            pan.toByte()
+        )
+        hid.sendReport(host, MouseConfig.REPORT_ID_MOUSE, report)
+    }
+
+    private fun sendKeyboardReport(modifiers: Int, key: Int) {
+        val host = connectedHost ?: return
+        val hid = hidDevice ?: return
+        val report = byteArrayOf(
+            modifiers.toByte(), 0, key.toByte(), 0, 0, 0, 0, 0
+        )
+        hid.sendReport(host, MouseConfig.REPORT_ID_KEYBOARD, report)
+    }
+
     fun moveMouse(dx: Float, dy: Float) {
-        val host = connectedHost
-        val hid = hidDevice
-        if (host == null || hid == null) {
-            // Uncommenting this will spam your logs, but it's useful to know if it's trying:
-            // log("Move failed: No host connected")
-            return
-        }
+        if (connectedHost == null || hidDevice == null) return
 
         pendingX += dx
         pendingY += dy
@@ -369,11 +398,101 @@ class BluetoothMouseManager private constructor(private val context: Context) {
 
         pendingX -= moveX
         pendingY -= moveY
+        sendMouseReport(buttonMask, moveX, moveY, 0, 0)
+    }
 
-        val report = byteArrayOf(0x00, moveX.toByte(), moveY.toByte())
-        if (hid.sendReport(host, 0, report) != true) {
-            log("Failed to send report data.")
+    fun scroll(dx: Float, dy: Float) {
+        if (connectedHost == null || hidDevice == null) return
+
+        // Drag up -> scroll up, drag right -> scroll right.
+        pendingScrollY += dy / SCROLL_DIVISOR
+        pendingScrollX += dx / SCROLL_DIVISOR
+
+        val wheel = pendingScrollY.toInt()
+        val pan = pendingScrollX.toInt()
+        if (wheel == 0 && pan == 0) return
+
+        pendingScrollY -= wheel
+        pendingScrollX -= pan
+        sendMouseReport(buttonMask, 0, 0, wheel.coerceIn(-127, 127), pan.coerceIn(-127, 127))
+    }
+
+    fun zoomBy(scale: Float) {
+        if (scale == 1f) return
+        if (connectedHost == null || hidDevice == null) return
+
+        // Pinch out (scale > 1) -> Ctrl + wheel up (zoom in).
+        pendingZoom += (scale - 1f) * ZOOM_SENSITIVITY
+        val steps = pendingZoom.toInt()
+        if (steps == 0) return
+
+        pendingZoom -= steps
+        sendKeyboardReport(MouseConfig.MOD_LEFT_CTRL, 0)
+        sendMouseReport(buttonMask, 0, 0, steps.coerceIn(-127, 127), 0)
+        sendKeyboardReport(0, 0)
+    }
+
+    fun leftClick() {
+        sendMouseReport(buttonMask or 0x01, 0, 0, 0, 0)
+        sendMouseReport(buttonMask and 0x01.inv(), 0, 0, 0, 0)
+    }
+
+    fun doubleClick() {
+        leftClick()
+        mainHandler.postDelayed({ leftClick() }, DOUBLE_CLICK_GAP_MS)
+    }
+
+    fun rightClick() {
+        sendMouseReport(buttonMask or 0x02, 0, 0, 0, 0)
+        sendMouseReport(buttonMask and 0x02.inv(), 0, 0, 0, 0)
+    }
+
+    fun leftButtonDown() {
+        buttonMask = buttonMask or 0x01
+        sendMouseReport(buttonMask, 0, 0, 0, 0)
+    }
+
+    fun leftButtonUp() {
+        buttonMask = buttonMask and 0x01.inv()
+        sendMouseReport(buttonMask, 0, 0, 0, 0)
+    }
+
+    /** Press and release a key combination, e.g. Win+Tab. */
+    fun sendShortcut(modifiers: Int, key: Int) {
+        sendKeyboardReport(modifiers, key)
+        sendKeyboardReport(0, 0)
+    }
+
+    fun threeFingerSwipe(direction: SwipeDirection) {
+        when (direction) {
+            SwipeDirection.UP -> sendShortcut(MouseConfig.MOD_LEFT_GUI, MouseConfig.KEY_TAB)          // Task View
+            SwipeDirection.DOWN -> sendShortcut(MouseConfig.MOD_LEFT_GUI, MouseConfig.KEY_D)          // Show desktop
+            SwipeDirection.RIGHT -> sendShortcut(MouseConfig.MOD_LEFT_ALT, MouseConfig.KEY_TAB)       // Alt+Tab
+            SwipeDirection.LEFT -> sendShortcut(
+                MouseConfig.MOD_LEFT_ALT or MouseConfig.MOD_LEFT_SHIFT, MouseConfig.KEY_TAB         // Alt+Shift+Tab
+            )
         }
+    }
+
+    fun threeFingerTap() {
+        sendShortcut(MouseConfig.MOD_LEFT_GUI, MouseConfig.KEY_S) // Search
+    }
+
+    fun fourFingerSwipe(direction: SwipeDirection) {
+        when (direction) {
+            SwipeDirection.UP -> sendShortcut(MouseConfig.MOD_LEFT_GUI, MouseConfig.KEY_TAB)          // Task View
+            SwipeDirection.DOWN -> sendShortcut(MouseConfig.MOD_LEFT_GUI, MouseConfig.KEY_D)          // Show desktop
+            SwipeDirection.RIGHT -> sendShortcut(
+                MouseConfig.MOD_LEFT_GUI or MouseConfig.MOD_LEFT_CTRL, MouseConfig.KEY_RIGHT_ARROW   // Next desktop
+            )
+            SwipeDirection.LEFT -> sendShortcut(
+                MouseConfig.MOD_LEFT_GUI or MouseConfig.MOD_LEFT_CTRL, MouseConfig.KEY_LEFT_ARROW    // Prev desktop
+            )
+        }
+    }
+
+    fun fourFingerTap() {
+        sendShortcut(MouseConfig.MOD_LEFT_GUI, MouseConfig.KEY_N) // Notification center
     }
 
     fun setPermissionError() {

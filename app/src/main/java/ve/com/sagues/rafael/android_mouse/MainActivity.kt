@@ -11,7 +11,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -22,7 +21,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -200,23 +198,27 @@ fun DebugGestureTracker(
                 .weight(1f)
                 .fillMaxWidth()
                 .background(Color(0xFFF5F5F5))
-                .pointerInput(Unit) {
-                    detectDragGestures(
-                        onDragEnd = {
-                            currentDx = 0f
-                            currentDy = 0f
-                        }
-                    ) { change, dragAmount ->
-                        change.consume()
-                        currentDx = dragAmount.x
-                        currentDy = dragAmount.y
-
-                        mouseManager.moveMouse(currentDx, currentDy)
-                    }
-                },
+                .trackpadGestures(
+                    onMove = { dx, dy ->
+                        currentDx = dx
+                        currentDy = dy
+                        mouseManager.moveMouse(dx, dy)
+                    },
+                    onScroll = { dx, dy -> mouseManager.scroll(dx, dy) },
+                    onZoom = { scale -> mouseManager.zoomBy(scale) },
+                    onLeftClick = { mouseManager.leftClick() },
+                    onDoubleClick = { mouseManager.doubleClick() },
+                    onRightClick = { mouseManager.rightClick() },
+                    onDragStart = { mouseManager.leftButtonDown() },
+                    onDragEnd = { mouseManager.leftButtonUp() },
+                    onThreeFingerSwipe = { dir -> mouseManager.threeFingerSwipe(dir) },
+                    onThreeFingerTap = { mouseManager.threeFingerTap() },
+                    onFourFingerSwipe = { dir -> mouseManager.fourFingerSwipe(dir) },
+                    onFourFingerTap = { mouseManager.fourFingerTap() }
+                ),
             contentAlignment = Alignment.Center
         ) {
-            Text("DRAG HERE", color = Color.Gray)
+            Text("TRACKPAD", color = Color.Gray)
         }
 
         // --- BOTTOM: LOG CONSOLE ---
