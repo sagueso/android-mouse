@@ -11,7 +11,35 @@ import kotlin.math.abs
 
 private const val DOUBLE_TAP_TIMEOUT_MS = 300L
 
-private enum class TrackpadMode { UNDECIDED, MOVE, SCROLL, SWIPE, DRAG }
+// A two-finger gesture only becomes a pinch after the finger span changes this much.
+// Parallel scrolling rarely changes the span by more than a few percent.
+private const val ZOOM_INTENT_THRESHOLD = 0.12f
+
+// Scrolling is not locked in at the first touch-slop crossing: a pinch often starts
+// with a small pan, so two-finger pans must travel farther before being treated as scroll.
+private const val TWO_FINGER_SCROLL_SLOP_MULTIPLIER = 2.5f
+
+private enum class TrackpadMode { UNDECIDED, MOVE, SCROLL, ZOOM, SWIPE, DRAG }
+
+internal enum class TwoFingerIntent { NONE, ZOOM, SCROLL }
+
+/**
+ * Decides what a two-finger gesture is trying to do.
+ *
+ * A pinch is only recognized when the finger span changes by more than
+ * [ZOOM_INTENT_THRESHOLD], so ordinary scrolling (which keeps the span almost
+ * constant) cannot be mistaken for a zoom. Scrolling also waits until the pan
+ * passes a higher threshold, because pinches usually start with a small pan.
+ */
+internal fun classifyTwoFingerIntent(
+    zoomChange: Float,
+    panDistance: Float,
+    touchSlop: Float
+): TwoFingerIntent = when {
+    abs(zoomChange) > ZOOM_INTENT_THRESHOLD -> TwoFingerIntent.ZOOM
+    panDistance > touchSlop * TWO_FINGER_SCROLL_SLOP_MULTIPLIER -> TwoFingerIntent.SCROLL
+    else -> TwoFingerIntent.NONE
+}
 
 /**
  * Multi-touch trackpad recognizer:
@@ -60,23 +88,62 @@ fun Modifier.trackpadGestures(
             totalPan += pan
             zoomAccum *= zoom
 
-            if (mode == TrackpadMode.UNDECIDED && totalPan.getDistance() > viewConfiguration.touchSlop) {
-                mode = when {
-                    secondTapCandidate && maxPointers == 1 -> TrackpadMode.DRAG
-                    maxPointers >= 3 -> TrackpadMode.SWIPE
-                    maxPointers == 2 -> TrackpadMode.SCROLL
-                    else -> TrackpadMode.MOVE
-                }
-                if (mode == TrackpadMode.DRAG) {
-                    dragStarted = true
-                    onDragStart()
+            // The event that locks the mode is already forwarded below as accumulated
+            // movement, so it must not be forwarded a second time.
+            var panConsumed = false
+            var zoomConsumed = false
+
+            if (mode == TrackpadMode.UNDECIDED) {
+                val slop = viewConfiguration.touchSlop
+                val panDistance = totalPan.getDistance()
+                val zoomChange = abs(zoomAccum - 1f)
+
+                when {
+                    maxPointers >= 3 && panDistance > slop ->
+                        mode = TrackpadMode.SWIPE
+
+                    maxPointers == 2 -> when (
+                        classifyTwoFingerIntent(zoomChange, panDistance, slop)
+                    ) {
+                        TwoFingerIntent.ZOOM -> {
+                            mode = TrackpadMode.ZOOM
+                            onZoom(zoomAccum)
+                            zoomAccum = 1f
+                            zoomConsumed = true
+                        }
+
+                        TwoFingerIntent.SCROLL -> {
+                            mode = TrackpadMode.SCROLL
+                            if (totalPan != Offset.Zero) {
+                                onScroll(totalPan.x, totalPan.y)
+                                panConsumed = true
+                            }
+                        }
+
+                        TwoFingerIntent.NONE -> Unit
+                    }
+
+                    maxPointers == 1 && panDistance > slop -> {
+                        mode = if (secondTapCandidate) TrackpadMode.DRAG else TrackpadMode.MOVE
+                        if (mode == TrackpadMode.DRAG) {
+                            dragStarted = true
+                            onDragStart()
+                        }
+                    }
                 }
             }
 
             when (mode) {
-                TrackpadMode.MOVE, TrackpadMode.DRAG -> if (pan != Offset.Zero) onMove(pan.x, pan.y)
+                TrackpadMode.MOVE, TrackpadMode.DRAG ->
+                    if (!panConsumed && pan != Offset.Zero) onMove(pan.x, pan.y)
+
                 TrackpadMode.SCROLL ->
-                    if (abs(zoomAccum - 1f) > 0.08f) onZoom(zoom) else onScroll(pan.x, pan.y)
+                    if (!panConsumed && pan != Offset.Zero) onScroll(pan.x, pan.y)
+
+                // Once a pinch is recognized it stays a pinch for the whole gesture.
+                TrackpadMode.ZOOM ->
+                    if (!zoomConsumed && abs(zoom - 1f) > 0.002f) onZoom(zoom)
+
                 else -> Unit // SWIPE: accumulated, resolved on release
             }
 
@@ -107,7 +174,7 @@ fun Modifier.trackpadGestures(
                 val direction = totalPan.dominantDirection()
                 if (maxPointers >= 4) onFourFingerSwipe(direction) else onThreeFingerSwipe(direction)
             }
-            else -> Unit // MOVE / SCROLL need no discrete action
+            else -> Unit // MOVE / SCROLL / ZOOM need no discrete action
         }
     }
 }
