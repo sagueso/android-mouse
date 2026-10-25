@@ -21,6 +21,61 @@ object MouseConfig {
     const val KEY_N = 0x11
     const val KEY_LEFT_ARROW = 0x50
     const val KEY_RIGHT_ARROW = 0x4F
+    const val KEY_ENTER = 0x28
+    const val KEY_ESCAPE = 0x29
+    const val KEY_BACKSPACE = 0x2A
+    const val KEY_SPACE = 0x2C
+    const val KEY_HOME = 0x4A
+    const val KEY_END = 0x4D
+    const val KEY_PAGE_UP = 0x4B
+    const val KEY_PAGE_DOWN = 0x4E
+    const val KEY_UP_ARROW = 0x52
+    const val KEY_DOWN_ARROW = 0x51
+
+    /** A printable character mapped to its HID usage ID (and whether Shift is required). */
+    data class HidKey(val usage: Int, val shift: Boolean = false)
+
+    /** Maps the characters produced by a software keyboard to HID usage IDs. */
+    fun keyForChar(char: Char): HidKey? = when (char) {
+        in 'a'..'z' -> HidKey(0x04 + (char - 'a'))
+        in 'A'..'Z' -> HidKey(0x04 + (char - 'A'), shift = true)
+        in '1'..'9' -> HidKey(0x1E + (char - '1'))
+        '0' -> HidKey(0x27)
+        ' ' -> HidKey(KEY_SPACE)
+        '-' -> HidKey(0x2D)
+        '_' -> HidKey(0x2D, shift = true)
+        '=' -> HidKey(0x2E)
+        '+' -> HidKey(0x2E, shift = true)
+        '[' -> HidKey(0x2F)
+        '{' -> HidKey(0x2F, shift = true)
+        ']' -> HidKey(0x30)
+        '}' -> HidKey(0x30, shift = true)
+        '\\' -> HidKey(0x31)
+        '|' -> HidKey(0x31, shift = true)
+        ';' -> HidKey(0x33)
+        ':' -> HidKey(0x33, shift = true)
+        '\'' -> HidKey(0x34)
+        '"' -> HidKey(0x34, shift = true)
+        '`' -> HidKey(0x35)
+        '~' -> HidKey(0x35, shift = true)
+        ',' -> HidKey(0x36)
+        '<' -> HidKey(0x36, shift = true)
+        '.' -> HidKey(0x37)
+        '>' -> HidKey(0x37, shift = true)
+        '/' -> HidKey(0x38)
+        '?' -> HidKey(0x38, shift = true)
+        '!' -> HidKey(0x1E, shift = true)
+        '@' -> HidKey(0x1F, shift = true)
+        '#' -> HidKey(0x20, shift = true)
+        '$' -> HidKey(0x21, shift = true)
+        '%' -> HidKey(0x22, shift = true)
+        '^' -> HidKey(0x23, shift = true)
+        '&' -> HidKey(0x24, shift = true)
+        '*' -> HidKey(0x25, shift = true)
+        '(' -> HidKey(0x26, shift = true)
+        ')' -> HidKey(0x27, shift = true)
+        else -> null
+    }
 
     /**
      * Composite HID report descriptor:

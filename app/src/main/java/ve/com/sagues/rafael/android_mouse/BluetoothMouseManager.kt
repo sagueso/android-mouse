@@ -3,13 +3,24 @@ package ve.com.sagues.rafael.android_mouse
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.math.roundToInt
 
-data class SavedHost(val address: String, val name: String)
+data class SavedHost(
+    val address: String,
+    val name: String,
+    val icon: String = "",
+    val lastConnectedAt: Long = 0L
+)
 
 @SuppressLint("MissingPermission")
 class BluetoothMouseManager private constructor(private val context: Context) {
@@ -40,9 +51,10 @@ class BluetoothMouseManager private constructor(private val context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var hidDevice: BluetoothHidDevice? = null
-    private var connectedHost: BluetoothDevice? = null
+    private var hidHost: BluetoothDevice? = null
     private var initialized = false
     private var reconnectAttempts = 0
+    private var manualDisconnect = false
 
     // Mouse button state (bit0 left, bit1 right, bit2 middle).
     private var buttonMask = 0
@@ -67,6 +79,27 @@ class BluetoothMouseManager private constructor(private val context: Context) {
     // Debug State exposed to UI
     private val _status = MutableStateFlow("Waiting to initialize...")
     val status: StateFlow<String> = _status.asStateFlow()
+
+    // Host currently plugged into the virtual cable (null when disconnected).
+    private val _connectedHost = MutableStateFlow<SavedHost?>(null)
+    val connectedHost: StateFlow<SavedHost?> = _connectedHost.asStateFlow()
+
+    // Number of seconds the phone is currently discoverable (0 = not discoverable).
+    private val _discoverableSeconds = MutableStateFlow(0)
+    val discoverableSeconds: StateFlow<Int> = _discoverableSeconds.asStateFlow()
+
+    // Rolling average of the local report dispatch time, in milliseconds.
+    private val _latencyMs = MutableStateFlow(1)
+    val latencyMs: StateFlow<Int> = _latencyMs.asStateFlow()
+
+    private val _phoneName = MutableStateFlow(
+        runCatching { bluetoothAdapter?.name }.getOrNull() ?: Build.MODEL
+    )
+    val phoneName: StateFlow<String> = _phoneName.asStateFlow()
+
+    // Emits the host name every time a connection is established.
+    private val _connectionEvents = MutableSharedFlow<String>(extraBufferCapacity = 4)
+    val connectionEvents: SharedFlow<String> = _connectionEvents.asSharedFlow()
 
     // True once the app is registered as a HID device.
     private val _registered = MutableStateFlow(false)
@@ -95,23 +128,76 @@ class BluetoothMouseManager private constructor(private val context: Context) {
         val raw = prefs.getString(KEY_HOSTS, null) ?: return emptyList()
         return raw.split("\n").mapNotNull { line ->
             val parts = line.split("|")
-            if (parts.size >= 2 && parts[0].isNotBlank()) SavedHost(parts[0], parts[1]) else null
+            if (parts.size >= 2 && parts[0].isNotBlank()) {
+                SavedHost(
+                    address = parts[0],
+                    name = parts[1],
+                    icon = parts.getOrNull(2).orEmpty(),
+                    lastConnectedAt = parts.getOrNull(3)?.toLongOrNull() ?: 0L
+                )
+            } else {
+                null
+            }
         }
     }
 
     private fun persistHosts(hosts: List<SavedHost>) {
         prefs.edit()
-            .putString(KEY_HOSTS, hosts.joinToString("\n") { "${it.address}|${it.name}" })
+            .putString(
+                KEY_HOSTS,
+                hosts.joinToString("\n") {
+                    "${it.address}|${it.name}|${it.icon}|${it.lastConnectedAt}"
+                }
+            )
             .apply()
     }
 
     private fun upsertHost(device: BluetoothDevice) {
         val list = _savedHosts.value.toMutableList()
         val index = list.indexOfFirst { it.address == device.address }
-        val host = SavedHost(device.address, device.name ?: device.address)
+        val existing = list.getOrNull(index)
+        val host = SavedHost(
+            address = device.address,
+            name = existing?.name?.takeIf { it.isNotBlank() } ?: device.name ?: device.address,
+            icon = existing?.icon.orEmpty(),
+            lastConnectedAt = System.currentTimeMillis()
+        )
         if (index >= 0) list[index] = host else list.add(host)
         _savedHosts.value = list
         persistHosts(list)
+    }
+
+    fun renameHost(address: String, name: String) {
+        val clean = name.trim()
+        if (clean.isEmpty()) return
+        val list = _savedHosts.value.map {
+            if (it.address == address) it.copy(name = clean) else it
+        }
+        _savedHosts.value = list
+        persistHosts(list)
+        if (_connectedHost.value?.address == address) {
+            _connectedHost.value = _connectedHost.value?.copy(name = clean)
+        }
+        log("Renamed host to $clean.")
+    }
+
+    fun setHostIcon(address: String, icon: String) {
+        val list = _savedHosts.value.map {
+            if (it.address == address) it.copy(icon = icon) else it
+        }
+        _savedHosts.value = list
+        persistHosts(list)
+        if (_connectedHost.value?.address == address) {
+            _connectedHost.value = _connectedHost.value?.copy(icon = icon)
+        }
+    }
+
+    fun isBonded(address: String): Boolean = try {
+        bluetoothAdapter.getRemoteDevice(address).bondState == BluetoothDevice.BOND_BONDED
+    } catch (e: IllegalArgumentException) {
+        false
+    } catch (e: SecurityException) {
+        false
     }
 
     fun forgetHost(address: String) {
@@ -133,7 +219,8 @@ class BluetoothMouseManager private constructor(private val context: Context) {
         }
 
         if (lastHostAddress == address) {
-            connectedHost = null
+            hidHost = null
+            _connectedHost.value = null
             lastHostAddress = null
         }
         _status.value = "Host forgotten and unpaired."
@@ -162,6 +249,7 @@ class BluetoothMouseManager private constructor(private val context: Context) {
     fun selectHost(address: String) {
         lastHostAddress = address
         reconnectAttempts = 0
+        manualDisconnect = false
 
         val hid = hidDevice
         if (hid == null) {
@@ -170,7 +258,7 @@ class BluetoothMouseManager private constructor(private val context: Context) {
         }
 
         // A HID device serves one host at a time: drop the current one first.
-        connectedHost?.let { if (it.address != address) hid.disconnect(it) }
+        hidHost?.let { if (it.address != address) hid.disconnect(it) }
 
         val device = try {
             bluetoothAdapter.getRemoteDevice(address)
@@ -235,7 +323,8 @@ class BluetoothMouseManager private constructor(private val context: Context) {
                 _status.value = "Profile Disconnected"
                 _registered.value = false
                 hidDevice = null
-                connectedHost = null
+                hidHost = null
+                _connectedHost.value = null
                 initialized = false
             }
         }
@@ -313,7 +402,7 @@ class BluetoothMouseManager private constructor(private val context: Context) {
             // Auto-reconnect to the host used last time.
             connectToSavedHost()
 
-            if (connectedHost == null && lastHostAddress == null) {
+            if (hidHost == null && lastHostAddress == null) {
                 _status.value = "Ready! Pair your phone with the PC."
             }
         }
@@ -322,15 +411,19 @@ class BluetoothMouseManager private constructor(private val context: Context) {
             val name = device?.name ?: "unknown"
             when (state) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    connectedHost = device
+                    hidHost = device
                     buttonMask = 0
                     reconnectAttempts = 0
+                    manualDisconnect = false
                     if (device != null) {
                         upsertHost(device)
                         lastHostAddress = device.address
+                        val saved = _savedHosts.value.firstOrNull { it.address == device.address }
+                        _connectedHost.value = saved ?: SavedHost(device.address, name)
                     }
                     _status.value = "CONNECTED to $name"
                     log("Host Connected: $name")
+                    _connectionEvents.tryEmit(name)
                 }
                 BluetoothProfile.STATE_CONNECTING -> {
                     _status.value = "Connecting to $name..."
@@ -341,31 +434,85 @@ class BluetoothMouseManager private constructor(private val context: Context) {
                     log("Disconnecting from $name...")
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    connectedHost = null
+                    hidHost = null
+                    _connectedHost.value = null
                     buttonMask = 0
-                    _status.value = "Disconnected - reconnecting..."
-                    log("Host Disconnected: $name")
-                    scheduleReconnect()
+                    if (manualDisconnect) {
+                        manualDisconnect = false
+                        _status.value = "Disconnected from $name."
+                        log("Host Disconnected: $name")
+                    } else {
+                        _status.value = "Disconnected - reconnecting..."
+                        log("Host Disconnected: $name")
+                        scheduleReconnect()
+                    }
                 }
             }
         }
     }
 
+    /** User requested a disconnect from the UI. */
+    fun disconnect() {
+        val host = hidHost
+        if (host == null) {
+            _status.value = "Not connected."
+            return
+        }
+        manualDisconnect = true
+        reconnectAttempts = MAX_RECONNECT_ATTEMPTS
+        _status.value = "Disconnecting from ${host.name}..."
+        hidDevice?.disconnect(host)
+    }
+
     /** Result of [android.bluetooth.BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE]. */
     fun onDiscoverableResult(resultCode: Int) {
         if (resultCode > 0) {
+            startDiscoverableCountdown(resultCode)
             _status.value = "Discoverable for ${resultCode}s. Pair from your PC now."
             log("Discoverable enabled for ${resultCode}s.")
         } else {
+            _discoverableSeconds.value = 0
             _status.value = "Not discoverable - the PC cannot pair."
             log("Discoverability request was denied.")
+        }
+    }
+
+    private val discoverableTicker = object : Runnable {
+        override fun run() {
+            val left = (_discoverableSeconds.value - 1).coerceAtLeast(0)
+            _discoverableSeconds.value = left
+            if (left > 0) mainHandler.postDelayed(this, 1_000L)
+        }
+    }
+
+    private fun startDiscoverableCountdown(seconds: Int) {
+        mainHandler.removeCallbacks(discoverableTicker)
+        _discoverableSeconds.value = seconds
+        mainHandler.postDelayed(discoverableTicker, 1_000L)
+    }
+
+    /** Renames the phone's Bluetooth adapter (requires BLUETOOTH_CONNECT). */
+    fun renamePhone(newName: String) {
+        val clean = newName.trim()
+        if (clean.isEmpty()) return
+        val renamed = try {
+            bluetoothAdapter?.setName(clean) ?: false
+        } catch (e: SecurityException) {
+            false
+        }
+        if (renamed) {
+            _phoneName.value = clean
+            log("Bluetooth name changed to $clean.")
+        } else {
+            _status.value = "Could not rename the Bluetooth device."
+            log("Renaming the Bluetooth adapter was rejected.")
         }
     }
 
     // -------------------- reports --------------------
 
     private fun sendMouseReport(buttons: Int, dx: Int, dy: Int, wheel: Int, pan: Int) {
-        val host = connectedHost ?: return
+        val host = hidHost ?: return
         val hid = hidDevice ?: return
         val report = byteArrayOf(
             buttons.toByte(),
@@ -374,20 +521,30 @@ class BluetoothMouseManager private constructor(private val context: Context) {
             wheel.toByte(),
             pan.toByte()
         )
+        val start = SystemClock.elapsedRealtimeNanos()
         hid.sendReport(host, MouseConfig.REPORT_ID_MOUSE, report)
+        trackDispatchLatency(start)
     }
 
     private fun sendKeyboardReport(modifiers: Int, key: Int) {
-        val host = connectedHost ?: return
+        val host = hidHost ?: return
         val hid = hidDevice ?: return
         val report = byteArrayOf(
             modifiers.toByte(), 0, key.toByte(), 0, 0, 0, 0, 0
         )
+        val start = SystemClock.elapsedRealtimeNanos()
         hid.sendReport(host, MouseConfig.REPORT_ID_KEYBOARD, report)
+        trackDispatchLatency(start)
+    }
+
+    private fun trackDispatchLatency(startNanos: Long) {
+        val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNanos) / 1_000_000f
+        val smoothed = _latencyMs.value * 0.8f + elapsedMs * 0.2f
+        _latencyMs.value = smoothed.roundToInt().coerceIn(1, 999)
     }
 
     fun moveMouse(dx: Float, dy: Float) {
-        if (connectedHost == null || hidDevice == null) return
+        if (hidHost == null || hidDevice == null) return
 
         pendingX += dx
         pendingY += dy
@@ -402,7 +559,7 @@ class BluetoothMouseManager private constructor(private val context: Context) {
     }
 
     fun scroll(dx: Float, dy: Float) {
-        if (connectedHost == null || hidDevice == null) return
+        if (hidHost == null || hidDevice == null) return
 
         // Drag up -> scroll up, drag right -> scroll right.
         pendingScrollY += dy / SCROLL_DIVISOR
@@ -419,7 +576,7 @@ class BluetoothMouseManager private constructor(private val context: Context) {
 
     fun zoomBy(scale: Float) {
         if (scale == 1f) return
-        if (connectedHost == null || hidDevice == null) return
+        if (hidHost == null || hidDevice == null) return
 
         // Pinch out (scale > 1) -> Ctrl + wheel up (zoom in).
         pendingZoom += (scale - 1f) * ZOOM_SENSITIVITY
@@ -461,6 +618,32 @@ class BluetoothMouseManager private constructor(private val context: Context) {
     fun sendShortcut(modifiers: Int, key: Int) {
         sendKeyboardReport(modifiers, key)
         sendKeyboardReport(0, 0)
+    }
+
+    /** Press and release a single key (0 modifiers unless provided). */
+    fun sendKey(key: Int, modifiers: Int = 0) = sendShortcut(modifiers, key)
+
+    /**
+     * Types [text] on the host, mapping each character to its HID usage ID.
+     * Reports are spaced out so no keystroke is coalesced by the host.
+     */
+    fun sendText(text: String) {
+        val chars = text.toList()
+        fun step(index: Int) {
+            if (index >= chars.size) return
+            val char = chars[index]
+            when (char) {
+                '\n' -> sendKey(MouseConfig.KEY_ENTER)
+                '\t' -> sendKey(MouseConfig.KEY_TAB)
+                else -> MouseConfig.keyForChar(char)?.let { key ->
+                    sendKey(key.usage, if (key.shift) MouseConfig.MOD_LEFT_SHIFT else 0)
+                }
+            }
+            if (index + 1 < chars.size) {
+                mainHandler.postDelayed({ step(index + 1) }, 14L)
+            }
+        }
+        step(0)
     }
 
     fun threeFingerSwipe(direction: SwipeDirection) {
