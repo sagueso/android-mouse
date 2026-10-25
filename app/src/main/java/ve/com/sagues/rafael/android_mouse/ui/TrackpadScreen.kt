@@ -68,6 +68,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.launch
 import ve.com.sagues.rafael.android_mouse.BluetoothMouseManager
+import ve.com.sagues.rafael.android_mouse.HostKeyboardLayout
 import ve.com.sagues.rafael.android_mouse.MouseConfig
 import ve.com.sagues.rafael.android_mouse.SavedHost
 import ve.com.sagues.rafael.android_mouse.trackpadGestures
@@ -94,6 +95,7 @@ fun TrackpadScreen(
     val latencyMs by mouseManager.latencyMs.collectAsState()
     val showClickBar by uiSettings.showClickBar.collectAsState()
     val edgeLock by uiSettings.edgeLock.collectAsState()
+    val keyboardLayout by uiSettings.keyboardLayout.collectAsState()
 
     val batteryPercent = readBatteryPercent()
 
@@ -191,7 +193,9 @@ fun TrackpadScreen(
     if (showKeyboard) {
         KeyboardDialog(
             hostName = connected?.name,
-            onSendText = { mouseManager.sendText(it) },
+            layout = keyboardLayout,
+            onLayoutChange = uiSettings::setKeyboardLayout,
+            onSendText = { mouseManager.sendText(it, keyboardLayout) },
             onKey = { key, modifiers -> mouseManager.sendKey(key, modifiers) },
             onDismiss = { showKeyboard = false }
         )
@@ -500,6 +504,8 @@ private fun QuickSwitchSheet(
 @Composable
 private fun KeyboardDialog(
     hostName: String?,
+    layout: HostKeyboardLayout,
+    onLayoutChange: (HostKeyboardLayout) -> Unit,
     onSendText: (String) -> Unit,
     onKey: (Int, Int) -> Unit,
     onDismiss: () -> Unit
@@ -524,16 +530,29 @@ private fun KeyboardDialog(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     KeyboardGlyph(modifier = Modifier.size(22.dp), tint = Mint)
                     Spacer(modifier = Modifier.width(10.dp))
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text("Keyboard", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
                         Text(
                             text = hostName?.let { "Typing to $it" } ?: "Not connected",
                             fontSize = 11.sp,
-                            color = TextMuted
+                            color = TextMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    KeyboardLayoutSelector(
+                        selected = layout,
+                        onSelect = onLayoutChange
+                    )
                 }
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "Match this to the computer's keyboard layout so characters arrive correctly.",
+                    fontSize = 10.sp,
+                    color = TextMuted
+                )
+                Spacer(modifier = Modifier.height(12.dp))
 
                 OutlinedTextField(
                     value = text,

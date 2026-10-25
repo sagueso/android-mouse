@@ -624,22 +624,25 @@ class BluetoothMouseManager private constructor(private val context: Context) {
     fun sendKey(key: Int, modifiers: Int = 0) = sendShortcut(modifiers, key)
 
     /**
-     * Types [text] on the host, mapping each character to its HID usage ID.
+     * Types [text] on the host using the selected host [layout]. Characters that
+     * need a modifier (Shift/AltGr) or a dead-key sequence are expanded to strokes.
      * Reports are spaced out so no keystroke is coalesced by the host.
      */
-    fun sendText(text: String) {
-        val chars = text.toList()
-        fun step(index: Int) {
-            if (index >= chars.size) return
-            val char = chars[index]
+    fun sendText(text: String, layout: HostKeyboardLayout) {
+        val strokes = ArrayList<HidKeystroke>(text.length)
+        text.forEach { char ->
             when (char) {
-                '\n' -> sendKey(MouseConfig.KEY_ENTER)
-                '\t' -> sendKey(MouseConfig.KEY_TAB)
-                else -> MouseConfig.keyForChar(char)?.let { key ->
-                    sendKey(key.usage, if (key.shift) MouseConfig.MOD_LEFT_SHIFT else 0)
-                }
+                '\n', '\r' -> strokes.add(HidKeystroke(MouseConfig.KEY_ENTER))
+                '\t' -> strokes.add(HidKeystroke(MouseConfig.KEY_TAB))
+                else -> strokes.addAll(layout.keystrokesFor(char))
             }
-            if (index + 1 < chars.size) {
+        }
+
+        fun step(index: Int) {
+            if (index >= strokes.size) return
+            val keystroke = strokes[index]
+            sendShortcut(keystroke.modifiers, keystroke.usage)
+            if (index + 1 < strokes.size) {
                 mainHandler.postDelayed({ step(index + 1) }, 14L)
             }
         }

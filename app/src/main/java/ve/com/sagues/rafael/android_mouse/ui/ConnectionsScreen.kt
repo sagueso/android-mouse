@@ -63,6 +63,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ve.com.sagues.rafael.android_mouse.BluetoothMouseManager
+import ve.com.sagues.rafael.android_mouse.HostKeyboardLayout
 import ve.com.sagues.rafael.android_mouse.SavedHost
 import ve.com.sagues.rafael.android_mouse.ui.theme.AccentAmber
 import ve.com.sagues.rafael.android_mouse.ui.theme.Danger
@@ -87,6 +88,7 @@ fun ConnectionsScreen(
     val status by mouseManager.status.collectAsState()
     val showClickBar by uiSettings.showClickBar.collectAsState()
     val edgeLock by uiSettings.edgeLock.collectAsState()
+    val keyboardLayout by uiSettings.keyboardLayout.collectAsState()
     val battery = readBatteryPercent()
 
     var renameTarget by remember { mutableStateOf<SavedHost?>(null) }
@@ -179,8 +181,10 @@ fun ConnectionsScreen(
                     TrackpadPreferences(
                         showClickBar = showClickBar,
                         edgeLock = edgeLock,
+                        keyboardLayout = keyboardLayout,
                         onShowClickBarChange = uiSettings::setShowClickBar,
-                        onEdgeLockChange = uiSettings::setEdgeLock
+                        onEdgeLockChange = uiSettings::setEdgeLock,
+                        onKeyboardLayoutChange = uiSettings::setKeyboardLayout
                     )
                 }
             }
@@ -436,8 +440,10 @@ private fun HostCard(
 private fun TrackpadPreferences(
     showClickBar: Boolean,
     edgeLock: Boolean,
+    keyboardLayout: HostKeyboardLayout,
     onShowClickBarChange: (Boolean) -> Unit,
-    onEdgeLockChange: (Boolean) -> Unit
+    onEdgeLockChange: (Boolean) -> Unit,
+    onKeyboardLayoutChange: (HostKeyboardLayout) -> Unit
 ) {
     Card(
         modifier = Modifier
@@ -467,6 +473,28 @@ private fun TrackpadPreferences(
                 checked = edgeLock,
                 onCheckedChange = onEdgeLockChange
             )
+            HorizontalDivider(
+                color = Color.White.copy(alpha = 0.06f),
+                modifier = Modifier.padding(vertical = 8.dp)
+            )
+            Row(
+                modifier = Modifier.padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Host keyboard layout", fontSize = 14.sp)
+                    Text(
+                        text = "Used when typing to the computer with the remote keyboard.",
+                        fontSize = 11.sp,
+                        color = TextMuted
+                    )
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                KeyboardLayoutSelector(
+                    selected = keyboardLayout,
+                    onSelect = onKeyboardLayoutChange
+                )
+            }
         }
     }
 }
